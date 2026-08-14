@@ -2994,6 +2994,7 @@ setTimeout(_initMediaPlaybackObserver,0);
 // Only the newest request may update the composer; otherwise an old Codex result
 // can reappear while the active conversation uses another provider.
 let _providerQuotaRefreshSeq=0;
+let _providerQuotaContextIdentity;
 
 function _formatQuotaMoneyShort(value){
   const n=Number(value);
@@ -3091,14 +3092,32 @@ async function refreshProviderQuotaIndicator(providerId){
 // back to the retained empty-composer model override so a non-default provider
 // selected before opening a conversation still scopes the quota request.
 function _currentQuotaProvider(){
-  if(typeof S!=='undefined'&&S&&S.session&&S.session.model_provider){
-    return S.session.model_provider;
+  if(typeof S!=='undefined'&&S&&S.session){
+    return S.session.model_provider||null;
   }
   if(typeof _readEmptyComposerModelOverride==='function'){
     const override=_readEmptyComposerModelOverride();
     if(override&&override.model_provider) return override.model_provider;
   }
   return null;
+}
+// Keep account-quota state aligned with the authoritative session/composer
+// context without turning syncTopbar() into a high-frequency network poll.
+// Session identity is part of the key so switching between conversations is a
+// real refresh even when both use the same provider. Explicit visibility and
+// Settings refreshes intentionally bypass this de-duplication.
+function _syncProviderQuotaForActiveContext(){
+  if(typeof S==='undefined'||!S||S._bootReady!==true) return;
+  const provider=_currentQuotaProvider();
+  const providerIdentity=String(provider||'').trim();
+  const contextIdentity=S.session
+    ? 'session:'+String(S.session.session_id||'')+'|provider:'+providerIdentity
+    : 'composer|provider:'+providerIdentity;
+  if(contextIdentity===_providerQuotaContextIdentity) return;
+  _providerQuotaContextIdentity=contextIdentity;
+  if(typeof refreshProviderQuotaIndicator==='function'){
+    void refreshProviderQuotaIndicator(provider);
+  }
 }
 window.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible'&&typeof refreshProviderQuotaIndicator==='function'){
@@ -11546,6 +11565,7 @@ function syncTopbar(){
     if(_profileLabel) _profileLabel.textContent=S.activeProfile||'default';
     const _titleLabel=$('titlebarProfileLabel');
     if(_titleLabel) _titleLabel.textContent=S.activeProfile||'default';
+    if(typeof _syncProviderQuotaForActiveContext==='function') _syncProviderQuotaForActiveContext();
     return;
   }
   const sessionTitle=S.session.title||t('untitled');
@@ -11673,6 +11693,7 @@ function syncTopbar(){
   if(profileLabel) profileLabel.textContent=S.activeProfile||'default';
   const titleLabel=$('titlebarProfileLabel');
   if(titleLabel) titleLabel.textContent=S.activeProfile||'default';
+  if(typeof _syncProviderQuotaForActiveContext==='function') _syncProviderQuotaForActiveContext();
 }
 
 function msgContent(m){
