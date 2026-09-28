@@ -159,6 +159,71 @@ def test_openrouter_quota_invalid_key_and_timeout_are_sanitized(monkeypatch, tmp
         _restore_config(old_cfg, old_mtime)
 
 
+def test_commandcode_quota_exposes_sanitized_windows(monkeypatch, tmp_path):
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("COMMANDCODE_API_KEY", "private-commandcode-key")
+    old_cfg, old_mtime = _with_config(model={"provider": "commandcode"})
+    import api.providers as providers
+
+    # commandcode's env var comes from the agent's bundled provider plugin; pin it so the test
+    # does not depend on hermes-agent being importable.
+    real_env_var_for = providers._provider_env_var_for
+    monkeypatch.setattr(
+        providers, "_provider_env_var_for",
+        lambda pid: "COMMANDCODE_API_KEY" if pid == "commandcode" else real_env_var_for(pid),
+    )
+
+    def fake_urlopen(req, timeout):
+        assert req.full_url == "https://api.commandcode.ai/alpha/billing/credits"
+        assert req.headers["Authorization"] == "Bearer private-commandcode-key"
+        assert timeout == 3.0
+        return _FakeResponse(json.dumps({
+            "credits": {"monthlyCredits": 7, "purchasedCredits": 2, "freeCredits": 1, "secret": "no"},
+            "windowLimits": {
+                "fiveHour": {"used": 3, "cap": 12, "resetAt": "2030-03-17T17:30:00Z"},
+                "weekly": {"used": 12, "cap": 30, "resetAt": "2030-03-24T12:30:00Z"},
+            },
+        }).encode())
+
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake_urlopen)
+    try:
+        result = providers.get_provider_quota()
+    finally:
+        _restore_config(old_cfg, old_mtime)
+
+    assert result["status"] == "available"
+    assert [w["remaining_percent"] for w in result["account_limits"]["windows"]] == [75.0, 60.0]
+    assert result["account_limits"]["details"] == ["Credits remaining: $10"]
+    assert "private-commandcode-key" not in repr(result)
+    assert "secret" not in repr(result)
+
+
+def test_opencode_go_quota_accepts_triple_window_response(monkeypatch, tmp_path):
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "private-opencode-key")
+    old_cfg, old_mtime = _with_config(model={"provider": "opencode-go"})
+    import api.providers as providers
+
+    def fake_urlopen(req, timeout):
+        assert req.full_url == "https://opencode.ai/zen/go/v1/usage"
+        assert req.headers["User-agent"] == "curl/8.5.0"
+        return _FakeResponse(json.dumps({"usage": {
+            "rolling": {"percent": 50, "status": "ok", "resetsAt": "2030-03-17T17:30:00Z"},
+            "weekly": {"percent": 30, "status": "ok", "resetsAt": "2030-03-24T12:30:00Z"},
+            "monthly": {"percent": 25, "status": "ok", "resetsAt": "2030-04-01T00:00:00Z"},
+        }}).encode())
+
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake_urlopen)
+    try:
+        result = providers.get_provider_quota()
+    finally:
+        _restore_config(old_cfg, old_mtime)
+
+    assert result["status"] == "available"
+    assert [w["remaining_percent"] for w in result["account_limits"]["windows"]] == [50.0, 70.0, 75.0]
+    assert "private-opencode-key" not in repr(result)
+
+
 def test_unsupported_provider_reports_followup_state(monkeypatch, tmp_path):
     """Providers without safe quota APIs should return a clear unsupported state."""
     monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
