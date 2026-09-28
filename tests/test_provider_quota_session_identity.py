@@ -686,3 +686,73 @@ return snapshot();
         "title": "OpenAI Codex — Account usage loaded — Weekly: 60% remaining",
     }
     assert report["mobile"]["label"] == "60%"
+
+
+@pytest.mark.parametrize("missing", [None, "", False])
+def test_missing_dollar_quota_hides_instead_of_showing_zero(missing):
+    """A missing or backend-rejected measurement arrives as null; Number(null) is 0,
+    which used to render as a false $0.00 remaining."""
+    report = _run_quota_scenario(
+        f"""
+const request = refreshProviderQuotaIndicator('openrouter');
+pending[0].resolve({{
+  status: 'available',
+  provider: 'openrouter',
+  display_name: 'OpenRouter',
+  quota: {{limit_remaining: {json.dumps(missing)}, usage: 3.5, limit: 10}},
+  account_limits: null,
+}});
+await request;
+return snapshot();
+"""
+    )
+
+    assert report["desktop"] == {"hidden": True, "label": "", "title": ""}
+    assert report["mobile"]["hidden"] is True
+
+
+def test_missing_dollar_usage_is_left_out_of_the_title():
+    report = _run_quota_scenario(
+        """
+const request = refreshProviderQuotaIndicator('openrouter');
+pending[0].resolve({
+  status: 'available',
+  provider: 'openrouter',
+  display_name: 'OpenRouter',
+  message: 'OpenRouter quota loaded',
+  quota: {limit_remaining: 6.5, usage: null, limit: 10},
+  account_limits: null,
+});
+await request;
+return snapshot();
+"""
+    )
+
+    assert report["desktop"] == {
+        "hidden": False,
+        "label": "$6.50",
+        "title": "OpenRouter — OpenRouter quota loaded — limit $10.0",
+    }
+
+
+def test_null_window_does_not_mask_a_later_valid_window():
+    report = _run_quota_scenario(
+        """
+const request = refreshProviderQuotaIndicator('openai-codex');
+pending[0].resolve({
+  status: 'available',
+  provider: 'openai-codex',
+  display_name: 'OpenAI Codex',
+  message: 'Account usage loaded',
+  account_limits: {windows: [
+    {label: 'Session', remaining_percent: null},
+    {label: 'Weekly', remaining_percent: 64},
+  ]},
+});
+await request;
+return snapshot();
+"""
+    )
+
+    assert report["desktop"]["label"] == "64%"
+    assert report["desktop"]["title"].endswith("Weekly: 64% remaining")
