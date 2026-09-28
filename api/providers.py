@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -1522,13 +1523,20 @@ def _active_provider_id() -> str | None:
 def _quota_number(value: Any) -> int | float | None:
     if isinstance(value, bool) or value is None:
         return None
-    if isinstance(value, (int, float)):
-        return value
+    # Remote quota APIs are untrusted: NaN/Infinity (json.loads accepts them) and
+    # integers beyond float range are not measurements; they would leak as $nan,
+    # break strict JSON, or raise OverflowError in the percentage math.
+    if isinstance(value, int):
+        return value if abs(value) <= sys.float_info.max else None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     try:
         text = str(value).strip()
         if not text:
             return None
         number = float(text)
+        if not math.isfinite(number):
+            return None
         return int(number) if number.is_integer() else number
     except (TypeError, ValueError):
         return None
@@ -1551,7 +1559,7 @@ def _quota_window(payload: Any, label: str) -> dict[str, Any] | None:
         return None
     used = _quota_number(payload.get("used", payload.get("used_amount")))
     limit = _quota_number(payload.get("limit", payload.get("limit_amount", payload.get("cap"))))
-    if used is None or limit is None or float(limit) <= 0:
+    if used is None or limit is None or float(used) < 0 or float(limit) <= 0:
         return None
     used_percent = max(0.0, min(100.0, float(used) / float(limit) * 100.0))
     return {
@@ -1576,7 +1584,7 @@ def _sanitize_opencode_go_quota(payload: Any) -> dict[str, Any] | None:
         if not isinstance(raw, dict):
             continue
         percent = _quota_number(raw.get("percent"))
-        if percent is None:
+        if percent is None or float(percent) < 0:
             continue
         used_percent = max(0.0, min(100.0, float(percent)))
         windows.append({
@@ -1610,10 +1618,12 @@ def _sanitize_commandcode_quota(payload: Any) -> dict[str, Any] | None:
         max(0.0, float(_quota_number(credits.get(key)) or 0))
         for key in ("monthlyCredits", "purchasedCredits", "freeCredits")
     )
+    # Each credit field is finite, but their sum can still overflow to inf.
+    details = [f"Credits remaining: ${remaining:g}"] if math.isfinite(remaining) else []
     return {
         "provider": "commandcode", "source": "usage_api",
         "title": "Command Code limits", "plan": "Command Code",
-        "windows": windows, "details": [f"Credits remaining: ${remaining:g}"],
+        "windows": windows, "details": details,
         "available": True, "unavailable_reason": None, "fetched_at": None,
     }
 
@@ -1639,8 +1649,10 @@ def _isoformat_utc(value: Any) -> str | None:
         dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        seconds = float(value) / 1000.0 if abs(float(value)) >= 1_000_000_000_000 else float(value)
         try:
+            # float() of an oversized int raises OverflowError too, so convert inside the guard.
+            number = float(value)
+            seconds = number / 1000.0 if abs(number) >= 1_000_000_000_000 else number
             return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat().replace("+00:00", "Z")
         except (OverflowError, OSError, ValueError):
             return None
