@@ -195,6 +195,7 @@ def test_commandcode_quota_exposes_sanitized_windows(monkeypatch, tmp_path):
         }).encode())
 
     _patch_bearer_quota_open(monkeypatch, providers, fake_urlopen)
+    monkeypatch.setattr(providers, "_local_pool_snapshot", lambda pid: None)
     try:
         result = providers.get_provider_quota()
     finally:
@@ -223,6 +224,7 @@ def test_opencode_go_quota_accepts_triple_window_response(monkeypatch, tmp_path)
         }}).encode())
 
     _patch_bearer_quota_open(monkeypatch, providers, fake_urlopen)
+    monkeypatch.setattr(providers, "_local_pool_snapshot", lambda pid: None)
     try:
         result = providers.get_provider_quota()
     finally:
@@ -245,7 +247,24 @@ _USAGE_API_KEYS = {
 _USAGE_API_KEY_ALIASES = ("OPENCODE_API_KEY",)
 
 
+_REAL_POOL = object()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_credential_pool_cache():
+    """The pool cache is process-wide and lives 24h: never let one test's pool reach another."""
+    config._CREDENTIAL_POOL_CACHE.clear()
+    yield
+    config._CREDENTIAL_POOL_CACHE.clear()
+
+
 def _usage_api_quota(monkeypatch, tmp_path, provider, urlopen, *, key="private-usage-key", pool=None):
+    """Run get_provider_quota() for a usage-API provider.
+
+    ``pool`` is the local credential-pool snapshot: None pins "no pool" (the result
+    must not depend on whether the Agent is importable, which seeds a pool entry from
+    the env key), a snapshot pins that pool, and _REAL_POOL leaves the real lookup.
+    """
     monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
     for env_var in (*_USAGE_API_KEYS.values(), *_USAGE_API_KEY_ALIASES):
         monkeypatch.delenv(env_var, raising=False)
@@ -260,7 +279,7 @@ def _usage_api_quota(monkeypatch, tmp_path, provider, urlopen, *, key="private-u
         lambda pid: _USAGE_API_KEYS.get(pid) or real_env_var_for(pid),
     )
     _patch_bearer_quota_open(monkeypatch, providers, urlopen)
-    if pool is not None:
+    if pool is not _REAL_POOL:
         monkeypatch.setattr(providers, "_local_pool_snapshot", lambda pid: pool)
     try:
         return providers.get_provider_quota()
@@ -459,12 +478,19 @@ def test_usage_api_quota_success_keeps_the_credential_pool(monkeypatch, tmp_path
 @pytest.mark.parametrize(
     "urlopen",
     [
-        lambda: _raiser(_http_error(401)), lambda: _raiser(_http_error(500)),
-        lambda: _raiser(TimeoutError("timed out")), lambda: _respond(b"[" * 100_000 + b"]" * 100_000),
+        lambda: _raiser(_http_error(403)), lambda: _raiser(_http_error(500)),
+        lambda: _raiser(TimeoutError("timed out")), lambda: _raiser(urllib.error.URLError("down")),
+        lambda: _respond(b"not json {"), lambda: _respond(b"[" * 100_000 + b"]" * 100_000),
+        # Parsed, but not the provider's quota document: an error envelope or unknown
+        # shape (also what an outage answering HTTP 200 looks like) is not an answer.
+        lambda: _respond(b'{"error": "temporarily unavailable"}'), lambda: _respond(b"[]"), lambda: _respond(b"null"),
     ],
-    ids=["401", "500", "timeout", "nested-json"],
+    ids=[
+        "403", "500", "timeout", "urlerror", "malformed-json", "nested-json",
+        "error-envelope", "json-list", "json-null",
+    ],
 )
-def test_usage_api_quota_failure_falls_through_to_the_credential_pool(monkeypatch, tmp_path, provider, urlopen):
+def test_usage_api_quota_transient_failure_falls_through_to_the_credential_pool(monkeypatch, tmp_path, provider, urlopen):
     result = _usage_api_quota(
         monkeypatch, tmp_path, provider, urlopen(), pool=_pool_snapshot("available", "exhausted"),
     )
@@ -474,6 +500,90 @@ def test_usage_api_quota_failure_falls_through_to_the_credential_pool(monkeypatc
     assert result["account_limits"]["pool"]["total_credentials"] == 2
     assert "credential pool" in result["message"]
     assert "private-usage-key" not in repr(result)
+
+
+@pytest.mark.parametrize("provider", sorted(_USAGE_API_KEYS))
+@pytest.mark.parametrize(
+    "urlopen, expected",
+    [
+        (lambda: _raiser(_http_error(401)), "invalid_key"),
+        (lambda: _respond(b'{"usage": {"weekly": {"percent": "NaN"}}, "windowLimits": {"weekly": {"used": -1, "cap": 30}}}'), "unavailable"),
+    ],
+    ids=["401", "all-windows-invalid"],
+)
+def test_usage_api_quota_definitive_failure_is_reported_next_to_the_pool(monkeypatch, tmp_path, provider, urlopen, expected):
+    """A rejected key or an answer with no usable window must not be hidden behind an available pool."""
+    result = _usage_api_quota(
+        monkeypatch, tmp_path, provider, urlopen(), pool=_pool_snapshot("available", "exhausted"),
+    )
+
+    assert result["status"] == expected
+    assert result["ok"] is False
+    assert result["account_limits"]["pool"]["total_credentials"] == 2
+    assert result["account_limits"]["windows"] == []
+    assert "private-usage-key" not in repr(result)
+
+
+def _install_env_seeding_agent_pool(monkeypatch, provider):
+    """Stand in for the Agent's credential pool, which seeds one entry from the provider env key.
+
+    This models the production state for a user with a single API key. The WebUI side
+    is real (_local_pool_snapshot() -> _pool_entry_payloads() -> load_pool(), with its
+    cache); the Agent's own seeding is stubbed, so this does not prove Agent behaviour.
+    """
+    calls = []
+
+    def load_pool(pid):
+        calls.append(pid)
+        # Only the provider under test has a pool, and only while its env key is set.
+        if pid != provider or not os.environ.get(_USAGE_API_KEYS[provider]):
+            return None
+        entry = SimpleNamespace(
+            label="env", source=f"env:{_USAGE_API_KEYS[provider]}", key_source="", last_status="ok",
+            last_status_at=None, last_error_code=None, last_error_reset_at=None,
+        )
+        return SimpleNamespace(entries=lambda: [entry])
+
+    if "agent" not in sys.modules:
+        package = types.ModuleType("agent")
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, "agent", package)
+    module = types.ModuleType("agent.credential_pool")
+    module.load_pool = load_pool
+    monkeypatch.setitem(sys.modules, "agent.credential_pool", module)
+    return calls
+
+
+@pytest.mark.parametrize("provider", sorted(_USAGE_API_KEYS))
+@pytest.mark.parametrize(
+    "urlopen, expected",
+    [
+        (lambda: _raiser(_http_error(401)), "invalid_key"),
+        (lambda: _respond(b'{"usage": {"weekly": {"percent": "NaN"}}, "windowLimits": {"weekly": {"used": -1, "cap": 30}}}'), "unavailable"),
+        (lambda: _respond(b'{"unexpected": true}'), "available"),
+        (lambda: _raiser(TimeoutError("timed out")), "available"),
+    ],
+    ids=["401", "all-windows-invalid", "unrecognized-shape", "timeout"],
+)
+def test_usage_api_quota_with_a_single_env_seeded_pool_entry(monkeypatch, tmp_path, provider, urlopen, expected):
+    """Real pool path, one env-seeded key: a 401 is invalid_key, only a transient failure shows the pool."""
+    calls = _install_env_seeding_agent_pool(monkeypatch, provider)
+
+    result = _usage_api_quota(monkeypatch, tmp_path, provider, urlopen(), pool=_REAL_POOL)
+
+    assert calls == [provider], "the real credential-pool lookup must run once, for this provider"
+    assert (config._credential_pool_profile_tag(), provider) in config._CREDENTIAL_POOL_CACHE
+    assert result["status"] == expected
+    assert result["account_limits"]["pool"]["total_credentials"] == 1
+    assert "private-usage-key" not in repr(result)
+
+
+def test_usage_api_reset_rejects_booleans():
+    import api.providers as providers
+
+    assert providers._usage_api_reset_at(True) is None
+    assert providers._usage_api_reset_at(False) is None
+    assert providers._usage_api_reset_at(1_900_000_000) == "2030-03-17T17:46:40Z"
 
 
 @pytest.mark.parametrize("provider", sorted(_USAGE_API_KEYS))
@@ -564,6 +674,14 @@ def test_usage_api_quota_keeps_status_words_and_iso_reset_times(monkeypatch, tmp
     (window,) = result["account_limits"]["windows"]
     assert window["detail"] == "rate_limited"
     assert window["reset_at"] == "2030-03-24T12:30:00Z"
+
+
+def test_quota_card_shows_the_failure_message_above_a_pool_breakdown():
+    panels = (ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+    assert (
+        "else if(status.status!=='available'&&status.message) "
+        "body=`<div class=\"provider-quota-message\">${esc(status.message)}</div>`+body;"
+    ) in panels
 
 
 def test_quota_card_keeps_usage_api_details_next_to_a_pool():

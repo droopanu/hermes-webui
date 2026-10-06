@@ -1577,7 +1577,9 @@ def _usage_api_reset_at(value: Any) -> str | None:
         except ValueError:
             return None
         return text
-    return _isoformat_utc(value) if isinstance(value, (int, float)) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return _isoformat_utc(value)
 
 
 def _usage_api_status_detail(value: Any) -> str | None:
@@ -1669,6 +1671,23 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 _BEARER_QUOTA_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _usage_api_quota_schema_recognized(provider: str, payload: Any) -> bool:
+    """True when the body is the provider's quota document, even with no usable window.
+
+    Tells "the account answered and nothing in it is usable" apart from an error
+    envelope or an unknown shape, which says nothing about the account.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if provider == "opencode-go":
+        quota = payload.get("quota", payload.get("data", payload.get("usage", payload)))
+        return isinstance(quota, dict) and any(
+            isinstance(quota.get(key), dict) for key in ("rolling", "weekly", "monthly")
+        )
+    limits = payload.get("windowLimits")
+    return isinstance(limits, dict) and any(isinstance(limits.get(key), dict) for key in ("fiveHour", "weekly"))
 
 
 def _fetch_bearer_quota(url: str, api_key: str) -> Any:
@@ -2370,17 +2389,36 @@ def get_provider_quota(provider_id: str | None = None, *, refresh: bool = False)
                 "account_limits": None,
                 "message": f"{display_name} quota status needs a configured API key.",
             }
+        # A definitive answer from the usage API (key rejected, or the provider's quota
+        # document with no usable window) is reported as such. Transient failures
+        # (network, timeout, non-401 HTTP errors, malformed or unrecognized body) say
+        # nothing about the account, so the credential-pool view below is the best
+        # information left.
         status = "unavailable"
+        definitive = False
+        pool_limits = _serialize_account_usage_snapshot(local_snapshot)
         if api_key:
             url = _OPENCODE_GO_QUOTA_URL if provider == "opencode-go" else f"{_COMMANDCODE_API_URL}/alpha/billing/credits"
+            account_limits = None
             try:
                 payload = _fetch_bearer_quota(url, api_key)
                 account_limits = _sanitize_opencode_go_quota(payload) if provider == "opencode-go" else _sanitize_commandcode_quota(payload)
-                if not account_limits:
-                    raise ValueError("unrecognized quota response")
+                definitive = not account_limits and _usage_api_quota_schema_recognized(provider, payload)
+            except urllib.error.HTTPError as exc:
+                # Only 401 means the key was rejected. 403 is also what a valid key
+                # without the subscription, or a WAF block, gets back.
+                if exc.code == 401:
+                    status, definitive = "invalid_key", True
+            except (
+                TimeoutError, urllib.error.URLError, http.client.HTTPException, json.JSONDecodeError,
+                OSError, ValueError, TypeError, OverflowError,
+                RecursionError,  # deeply nested JSON, in the parser or a sanitizer
+            ):
+                account_limits = None
+            if account_limits:
                 # The usage API reports one key's windows; keep the credential-pool
                 # breakdown next to them so pooled users still see every entry.
-                pool = (_serialize_account_usage_snapshot(local_snapshot) or {}).get("pool")
+                pool = (pool_limits or {}).get("pool")
                 if isinstance(pool, dict):
                     account_limits["pool"] = pool
                 return {
@@ -2389,22 +2427,12 @@ def get_provider_quota(provider_id: str | None = None, *, refresh: bool = False)
                     "account_limits": account_limits, "label": account_limits["title"],
                     "message": f"{display_name} account limits loaded.",
                 }
-            except urllib.error.HTTPError as exc:
-                # Only 401 means the key was rejected. 403 is also what a valid key
-                # without the subscription, or a WAF block, gets back.
-                status = "invalid_key" if exc.code == 401 else "unavailable"
-            except (
-                TimeoutError, urllib.error.URLError, http.client.HTTPException, json.JSONDecodeError,
-                OSError, ValueError, RecursionError,  # RecursionError: deeply nested JSON
-            ):
-                status = "unavailable"
-        # A usage-API failure must not hide the credential pool: fall through to
-        # the generic pool response below when the provider has one.
-        if local_snapshot is None:
+        if definitive or local_snapshot is None:
             return {
                 "ok": False, "provider": provider, "display_name": display_name,
                 "supported": True, "status": status, "quota": None,
-                "account_limits": None,
+                # The pool breakdown, when there is one, stays next to the failure.
+                "account_limits": pool_limits,
                 "message": f"{display_name} rejected the configured API key." if status == "invalid_key" else f"{display_name} quota status is temporarily unavailable.",
             }
 
