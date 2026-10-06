@@ -11266,7 +11266,9 @@ function _buildProviderQuotaCard(status){
   let body='';
   if(accountLimits&&(status.status==='available'||accountLimits.pool)){
     const windows=Array.isArray(accountLimits.windows)?accountLimits.windows:[];
-    const details=Array.isArray(accountLimits.details)&&!accountLimits.pool?accountLimits.details:[];
+    // A pool snapshot's own details only repeat the breakdown below; usage-API details
+    // (e.g. credit balance) are the account's and stay visible next to the pool.
+    const details=Array.isArray(accountLimits.details)&&(!accountLimits.pool||accountLimits.source==='usage_api')?accountLimits.details:[];
     const windowHtml=windows.map(w=>{
       const used=_formatProviderQuotaPercent(w&&w.used_percent);
       const reset=_formatProviderQuotaReset(w&&w.reset_at);

@@ -11,10 +11,12 @@ import atexit
 import base64
 import copy
 import hashlib
+import http.client
 import json
 import logging
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -81,6 +83,10 @@ _OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 _OPENCODE_GO_QUOTA_URL = "https://opencode.ai/zen/go/v1/usage"
 _COMMANDCODE_API_URL = "https://api.commandcode.ai"
 _PROVIDER_QUOTA_TIMEOUT_SECONDS = 3.0
+_PROVIDER_QUOTA_MAX_BYTES = 256 * 1024
+# Providers whose limits come from a bearer-authenticated usage API. The agent's
+# commandcode-anthropic profile shares COMMANDCODE_API_KEY and the billing account.
+_USAGE_API_QUOTA_PROVIDERS = frozenset({"opencode-go", "commandcode", "commandcode-anthropic"})
 _ACCOUNT_USAGE_SUBPROCESS_TIMEOUT_SECONDS = 35.0
 _ACCOUNT_USAGE_CACHE_TTL_SECONDS = 45.0
 _PROVIDERS_CACHE_TTL_SECONDS = 30.0
@@ -1554,6 +1560,32 @@ def _sanitize_openrouter_quota(payload: Any) -> dict[str, int | float | None]:
     }
 
 
+# One short word: no digits, spaces or punctuation, so it cannot carry a token.
+_QUOTA_STATUS_RE = re.compile(r"[A-Za-z_]{1,16}")
+
+
+def _usage_api_reset_at(value: Any) -> str | None:
+    """Reset time from an untrusted usage API: numeric epochs and ISO-8601 strings only.
+
+    Free text is dropped rather than passed through, so a response cannot echo
+    arbitrary content (or the bearer key) into the quota payload.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text)
+        except ValueError:
+            return None
+        return text
+    return _isoformat_utc(value) if isinstance(value, (int, float)) else None
+
+
+def _usage_api_status_detail(value: Any) -> str | None:
+    """A short status word ("ok", "rate_limited") from an untrusted usage API, or None."""
+    text = value.strip() if isinstance(value, str) else ""
+    return text if _QUOTA_STATUS_RE.fullmatch(text) else None
+
+
 def _quota_window(payload: Any, label: str) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
@@ -1566,7 +1598,7 @@ def _quota_window(payload: Any, label: str) -> dict[str, Any] | None:
         "label": label,
         "used_percent": used_percent,
         "remaining_percent": 100.0 - used_percent,
-        "reset_at": _isoformat_utc(payload.get("reset_at", payload.get("resetAt"))),
+        "reset_at": _usage_api_reset_at(payload.get("reset_at", payload.get("resetAt"))),
         "detail": f"${float(used):g} used of ${float(limit):g}",
     }
 
@@ -1590,8 +1622,8 @@ def _sanitize_opencode_go_quota(payload: Any) -> dict[str, Any] | None:
         windows.append({
             "label": label, "used_percent": used_percent,
             "remaining_percent": 100.0 - used_percent,
-            "reset_at": _isoformat_utc(raw.get("resetsAt")),
-            "detail": str(raw.get("status") or "").strip() or None,
+            "reset_at": _usage_api_reset_at(raw.get("resetsAt")),
+            "detail": _usage_api_status_detail(raw.get("status")),
         })
     if not windows:
         return None
@@ -1622,10 +1654,21 @@ def _sanitize_commandcode_quota(payload: Any) -> dict[str, Any] | None:
     details = [f"Credits remaining: ${remaining:g}"] if math.isfinite(remaining) else []
     return {
         "provider": "commandcode", "source": "usage_api",
-        "title": "Command Code limits", "plan": "Command Code",
+        "title": "CommandCode limits", "plan": "CommandCode",
         "windows": windows, "details": details,
         "available": True, "unavailable_reason": None, "fetched_at": None,
     }
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: urllib replays the Authorization header to the new
+    location, including another host. The 30x then surfaces as an HTTPError."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_BEARER_QUOTA_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 
 def _fetch_bearer_quota(url: str, api_key: str) -> Any:
@@ -1637,8 +1680,10 @@ def _fetch_bearer_quota(url: str, api_key: str) -> Any:
             "User-Agent": "curl/8.5.0",
         },
     )
-    with urllib.request.urlopen(req, timeout=_PROVIDER_QUOTA_TIMEOUT_SECONDS) as resp:
-        raw = resp.read()
+    with _BEARER_QUOTA_OPENER.open(req, timeout=_PROVIDER_QUOTA_TIMEOUT_SECONDS) as resp:
+        raw = resp.read(_PROVIDER_QUOTA_MAX_BYTES + 1)
+    if len(raw) > _PROVIDER_QUOTA_MAX_BYTES:
+        raise ValueError("quota response too large")
     return json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
 
 
@@ -2248,10 +2293,7 @@ def get_provider_quota(provider_id: str | None = None, *, refresh: bool = False)
             "message": "No active provider is configured.",
         }
 
-    display_name = {
-        "commandcode": "Command Code",
-        "opencode-go": "OpenCode Go",
-    }.get(provider, _PROVIDER_DISPLAY.get(provider, provider.replace("-", " ").title()))
+    display_name = effective_provider_display_name(provider, _PROVIDER_DISPLAY)
     if provider in _ACCOUNT_USAGE_PROVIDERS:
         return _provider_account_usage_status(provider, display_name, refresh=refresh)
 
@@ -2316,39 +2358,56 @@ def get_provider_quota(provider_id: str | None = None, *, refresh: bool = False)
                 "message": "OpenRouter quota status is temporarily unavailable.",
             }
 
-    if provider in {"opencode-go", "commandcode"}:
+    local_snapshot = _local_pool_snapshot(provider)
+    if provider in _USAGE_API_QUOTA_PROVIDERS:
         api_key = _get_provider_api_key(provider)
-        if not api_key:
+        if not api_key and provider == "commandcode-anthropic":
+            api_key = _get_provider_api_key("commandcode")
+        if not api_key and local_snapshot is None:
             return {
                 "ok": False, "provider": provider, "display_name": display_name,
                 "supported": True, "status": "no_key", "quota": None,
                 "account_limits": None,
                 "message": f"{display_name} quota status needs a configured API key.",
             }
-        url = _OPENCODE_GO_QUOTA_URL if provider == "opencode-go" else f"{_COMMANDCODE_API_URL}/alpha/billing/credits"
-        try:
-            payload = _fetch_bearer_quota(url, api_key)
-            account_limits = _sanitize_opencode_go_quota(payload) if provider == "opencode-go" else _sanitize_commandcode_quota(payload)
-            if not account_limits:
-                raise ValueError("unrecognized quota response")
+        status = "unavailable"
+        if api_key:
+            url = _OPENCODE_GO_QUOTA_URL if provider == "opencode-go" else f"{_COMMANDCODE_API_URL}/alpha/billing/credits"
+            try:
+                payload = _fetch_bearer_quota(url, api_key)
+                account_limits = _sanitize_opencode_go_quota(payload) if provider == "opencode-go" else _sanitize_commandcode_quota(payload)
+                if not account_limits:
+                    raise ValueError("unrecognized quota response")
+                # The usage API reports one key's windows; keep the credential-pool
+                # breakdown next to them so pooled users still see every entry.
+                pool = (_serialize_account_usage_snapshot(local_snapshot) or {}).get("pool")
+                if isinstance(pool, dict):
+                    account_limits["pool"] = pool
+                return {
+                    "ok": True, "provider": provider, "display_name": display_name,
+                    "supported": True, "status": "available", "quota": None,
+                    "account_limits": account_limits, "label": account_limits["title"],
+                    "message": f"{display_name} account limits loaded.",
+                }
+            except urllib.error.HTTPError as exc:
+                # Only 401 means the key was rejected. 403 is also what a valid key
+                # without the subscription, or a WAF block, gets back.
+                status = "invalid_key" if exc.code == 401 else "unavailable"
+            except (
+                TimeoutError, urllib.error.URLError, http.client.HTTPException, json.JSONDecodeError,
+                OSError, ValueError, RecursionError,  # RecursionError: deeply nested JSON
+            ):
+                status = "unavailable"
+        # A usage-API failure must not hide the credential pool: fall through to
+        # the generic pool response below when the provider has one.
+        if local_snapshot is None:
             return {
-                "ok": True, "provider": provider, "display_name": display_name,
-                "supported": True, "status": "available", "quota": None,
-                "account_limits": account_limits, "label": account_limits["title"],
-                "message": f"{display_name} account limits loaded.",
+                "ok": False, "provider": provider, "display_name": display_name,
+                "supported": True, "status": status, "quota": None,
+                "account_limits": None,
+                "message": f"{display_name} rejected the configured API key." if status == "invalid_key" else f"{display_name} quota status is temporarily unavailable.",
             }
-        except urllib.error.HTTPError as exc:
-            status = "invalid_key" if exc.code in (401, 403) else "unavailable"
-        except (TimeoutError, urllib.error.URLError, json.JSONDecodeError, OSError, ValueError):
-            status = "unavailable"
-        return {
-            "ok": False, "provider": provider, "display_name": display_name,
-            "supported": True, "status": status, "quota": None,
-            "account_limits": None,
-            "message": f"{display_name} rejected the configured API key." if status == "invalid_key" else f"{display_name} quota status is temporarily unavailable.",
-        }
 
-    local_snapshot = _local_pool_snapshot(provider)
     if local_snapshot is not None:
         account_limits = _serialize_account_usage_snapshot(local_snapshot)
         if account_limits and account_limits.get("available"):
