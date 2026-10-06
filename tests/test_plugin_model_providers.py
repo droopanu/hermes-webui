@@ -11,6 +11,8 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+
 import api.config as config
 import api.profiles as profiles
 from api.plugin_providers import invalidate_plugin_model_provider_cache
@@ -236,54 +238,6 @@ class TestPluginFallbackModelsInStaticCatalog:
     the ``ProviderProfile.fallback_models`` declared by the plugin itself on
     this cold path.
     """
-
-    def test_static_catalog_surfaces_logged_in_keyless_subscription_plugin(
-        self, monkeypatch, tmp_path
-    ):
-        profile = SimpleNamespace(
-            name="subscription-plugin",
-            display_name="Subscription Plugin",
-            env_vars=(),
-            auth_type="external",
-            aliases=(),
-            fallback_models=("opus-test",),
-        )
-        fake_providers = types.ModuleType("providers")
-        fake_providers.list_providers = lambda: [profile]
-        monkeypatch.setitem(sys.modules, "providers", fake_providers)
-        invalidate_plugin_model_provider_cache()
-        _install_fake_hermes_cli(monkeypatch, authenticated=False, model_ids=[])
-        from hermes_cli import auth as fake_auth
-        auth_state = {"logged_in": True}
-        fake_auth.get_auth_status = lambda pid: auth_state if pid == profile.name else {}
-        monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-        old_cfg = dict(config.cfg)
-        old_mtime = config._cfg_mtime
-        config.cfg.clear()
-        config.cfg["model"] = {"provider": "gemini", "default": "gemini-2.5-flash"}
-        config.cfg["providers"] = {}
-        try:
-            config._cfg_mtime = config.Path(config._get_config_path()).stat().st_mtime
-        except Exception:
-            config._cfg_mtime = 0.0
-        config.invalidate_models_cache()
-        try:
-            catalog = config._static_models_catalog_without_live_probes()
-            group = next((g for g in catalog["groups"] if g["provider_id"] == profile.name), None)
-            assert group is not None
-            assert any(m["id"] == "@subscription-plugin:opus-test" for m in group["models"])
-
-            auth_state["logged_in"] = False
-            catalog = config._static_models_catalog_without_live_probes()
-            assert all(g["provider_id"] != profile.name for g in catalog["groups"])
-        finally:
-            config.cfg.clear()
-            config.cfg.update(old_cfg)
-            config._cfg_mtime = old_mtime
-            config.invalidate_models_cache()
-            invalidate_plugin_model_provider_cache()
 
     def test_static_catalog_surfaces_plugin_fallback_models(
         self, monkeypatch, tmp_path
@@ -520,3 +474,149 @@ class TestPluginModelProviderRouting:
             config.cfg.clear()
             config.cfg.update(old_cfg)
             invalidate_plugin_model_provider_cache()
+
+
+# Auth classes the Agent's ``get_auth_status`` dispatcher resolves for a plugin
+# provider that has no API key. Anything else (for example a made-up
+# ``auth_type="external"``) is reported as logged out by the Agent.
+_AGENT_KEYLESS_AUTH_TYPES = ("external_process", "oauth_external", "oauth_device_code")
+
+
+def _keyless_plugin_profile(auth_type):
+    return SimpleNamespace(
+        name="keyless-plugin",
+        display_name="Keyless Plugin",
+        env_vars=(),
+        auth_type=auth_type,
+        aliases=(),
+        fallback_models=("keyless-model",),
+    )
+
+
+def _install_keyless_plugin(monkeypatch, profile):
+    fake_providers = types.ModuleType("providers")
+    fake_providers.list_providers = lambda: [profile]
+    monkeypatch.setitem(sys.modules, "providers", fake_providers)
+    invalidate_plugin_model_provider_cache()
+
+
+def _install_agent_shaped_auth(monkeypatch, profile, *, signed_in):
+    """Fake ``hermes_cli.auth`` that dispatches on ``auth_type`` like the Agent.
+
+    It does not hand back a canned answer: a profile whose ``auth_type`` the
+    Agent does not dispatch gets ``{"logged_in": False}``, whatever
+    ``signed_in`` says. ``signed_in`` may be an exception to raise.
+    """
+    calls = []
+
+    def _external_process_status(pid):
+        return {"configured": signed_in, "logged_in": signed_in, "auth_verified": signed_in}
+
+    def _plugin_oauth_status(pid):
+        return {"logged_in": signed_in, "provider": pid}
+
+    status_by_auth_type = {
+        "external_process": _external_process_status,
+        "oauth_external": _plugin_oauth_status,
+        "oauth_device_code": _plugin_oauth_status,
+    }
+
+    def _get_auth_status(pid):
+        calls.append(pid)
+        if isinstance(signed_in, Exception):
+            raise signed_in
+        builder = status_by_auth_type.get(profile.auth_type) if pid == profile.name else None
+        return builder(pid) if builder else {"logged_in": False}
+
+    fake_pkg = types.ModuleType("hermes_cli")
+    fake_pkg.__path__ = []
+    fake_models = types.ModuleType("hermes_cli.models")
+    fake_models.list_available_providers = lambda: []
+    fake_models.provider_model_ids = lambda pid: []
+    fake_auth = types.ModuleType("hermes_cli.auth")
+    fake_auth.get_auth_status = _get_auth_status
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.models", fake_models)
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", fake_auth)
+    return calls
+
+
+def _static_catalog_groups(monkeypatch, tmp_path):
+    """``{provider_id: [model ids]}`` from the static catalog with another provider active."""
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    old_cfg = dict(config.cfg)
+    old_mtime = config._cfg_mtime
+    config.cfg.clear()
+    config.cfg["model"] = {"provider": "gemini", "default": "gemini-2.5-flash"}
+    config.cfg["providers"] = {}
+    try:
+        config._cfg_mtime = config.Path(config._get_config_path()).stat().st_mtime
+    except Exception:
+        config._cfg_mtime = 0.0
+    config.invalidate_models_cache()
+    try:
+        catalog = config._static_models_catalog_without_live_probes()
+        return {
+            g.get("provider_id"): [m.get("id") for m in g.get("models", [])]
+            for g in catalog.get("groups", [])
+        }
+    finally:
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+        config._cfg_mtime = old_mtime
+        config.invalidate_models_cache()
+        invalidate_plugin_model_provider_cache()
+
+
+class TestKeylessPluginInStaticCatalog:
+    """Plugin providers that sign in without an API key, on the static catalog path.
+
+    The static catalog only admitted plugin providers with a key, so a
+    signed-in subscription or external-CLI provider was missing from the model
+    picker until a live rebuild listed it.
+    """
+
+    @pytest.mark.parametrize("auth_type", _AGENT_KEYLESS_AUTH_TYPES)
+    def test_signed_in_keyless_plugin_is_listed_with_its_fallback_models(
+        self, monkeypatch, tmp_path, auth_type
+    ):
+        profile = _keyless_plugin_profile(auth_type)
+        _install_keyless_plugin(monkeypatch, profile)
+        _install_agent_shaped_auth(monkeypatch, profile, signed_in=True)
+
+        groups = _static_catalog_groups(monkeypatch, tmp_path)
+
+        assert groups.get("keyless-plugin") == ["@keyless-plugin:keyless-model"]
+
+    @pytest.mark.parametrize("auth_type", _AGENT_KEYLESS_AUTH_TYPES)
+    def test_signed_out_keyless_plugin_is_not_listed(self, monkeypatch, tmp_path, auth_type):
+        profile = _keyless_plugin_profile(auth_type)
+        _install_keyless_plugin(monkeypatch, profile)
+        calls = _install_agent_shaped_auth(monkeypatch, profile, signed_in=False)
+
+        assert "keyless-plugin" not in _static_catalog_groups(monkeypatch, tmp_path)
+        assert calls == ["keyless-plugin"]
+
+    @pytest.mark.parametrize("auth_type", _AGENT_KEYLESS_AUTH_TYPES)
+    def test_keyless_plugin_is_not_listed_when_the_auth_lookup_fails(
+        self, monkeypatch, tmp_path, auth_type
+    ):
+        profile = _keyless_plugin_profile(auth_type)
+        _install_keyless_plugin(monkeypatch, profile)
+        calls = _install_agent_shaped_auth(
+            monkeypatch, profile, signed_in=RuntimeError("auth store unreadable")
+        )
+
+        assert "keyless-plugin" not in _static_catalog_groups(monkeypatch, tmp_path)
+        assert calls == ["keyless-plugin"]
+
+    def test_plugin_with_an_auth_type_the_agent_does_not_dispatch_is_not_listed(
+        self, monkeypatch, tmp_path
+    ):
+        profile = _keyless_plugin_profile("external")
+        _install_keyless_plugin(monkeypatch, profile)
+        _install_agent_shaped_auth(monkeypatch, profile, signed_in=True)
+
+        assert "keyless-plugin" not in _static_catalog_groups(monkeypatch, tmp_path)
+
